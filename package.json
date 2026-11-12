@@ -1,0 +1,31 @@
+{
+  "name": "pagomovil-receiver",
+  "version": "1.0.0",
+  "description": "Serverless Pago Móvil webhook receiver and reconciliation engine built with Hono and Cloudflare D1",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy --minify",
+    "db:migrate:local": "wrangler d1 execute pagomovil-db --local --file=./schema.sql",
+    "db:migrate:remote": "wrangler d1 execute pagomovil-db --remote --file=./schema.sql",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "pagomovil",
+    "cloudflare-workers",
+    "hono",
+    "d1",
+    "venezuela",
+    "webhooks"
+  ],
+  "author": "cegh2001",
+  "license": "MIT",
+  "dependencies": {
+    "hono": "^4.6.14"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241112.0",
+    "typescript": "^5.7.2",
+    "wrangler": "^3.91.0"
+  }
+}
