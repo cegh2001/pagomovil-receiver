@@ -23,9 +23,11 @@ export type PaymentPayload = {
 
 export type VerifyRequest = {
   referencia?: string
+  telefono?: string
   telefonoUltimos4?: string
-  montoEsperado: number
+  montoEsperado: number | string
   fecha?: string
+  banco?: string
 }
 
 export type PagoEntity = {

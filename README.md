@@ -122,32 +122,35 @@ All protected endpoints require one of the following authentication headers:
 * **Endpoint:** `POST /api/pagos/verificar`
 * **Headers:** `X-Webhook-Secret: <YOUR_SECRET>`
 
-#### Case A: Verifying by Reference Suffix (e.g. BDV)
-The customer provides whatever reference digits appear on their receipt (last 4 to 8 digits):
+#### Cascading Strategy (Recommended):
+Send both `referencia` (if entered by customer) and `telefono` (full or last 4 digits) along with `montoEsperado`. The engine will first attempt to match by reference suffix; if no reference match is found (or if the bank was Bancamiga/BFC where reference is null), it automatically cascades to match by phone suffix + amount:
+
 ```json
 {
   "referencia": "23334023",
-  "montoEsperado": 1.00
+  "telefono": "04129897838",
+  "montoEsperado": 100.00,
+  "fecha": "12/11/2026",
+  "banco": "BANCAMIGA"
 }
 ```
 
-#### Case B: Verifying by Phone (e.g. BFC without reference)
-```json
-{
-  "telefonoUltimos4": "9152",
-  "montoEsperado": 35.00
-}
-```
+* `referencia`: (Optional) Last 4 to 12 digits of the transaction.
+* `telefono`: (Optional) Full customer phone number (`04129897838`) or just the last 4 digits (`7838`).
+* `montoEsperado`: (Required) Exact amount in Bs. (number or string `"100.00"`).
+* `fecha`: (Optional) Date filter (`dd/MM/yyyy` or `dd-MM-yy`).
+* `banco`: (Optional) Bank filter (`BDV`, `BFC`, `BANCAMIGA`).
 
 #### Successful Response (`200 OK`):
 ```json
 {
   "verificado": true,
+  "metodo_coincidencia": "referencia", 
   "mensaje": "Pago verificado y marcado como utilizado exitosamente",
   "pago": {
     "id": 1,
     "bank": "BDV",
-    "amount_bs": 1.0,
+    "amount_bs": 100.0,
     "reference": "334023334023",
     "phone_number": "0412-9897838",
     "phone_last_digits": "7838",
@@ -157,6 +160,7 @@ The customer provides whatever reference digits appear on their receipt (last 4 
   }
 }
 ```
+*(Note: `metodo_coincidencia` will return `"referencia"` if matched in Step 1, or `"telefono_monto"` if matched in Step 2 cascade).*
 
 ---
 

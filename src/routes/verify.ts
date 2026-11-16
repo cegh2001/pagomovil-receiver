@@ -3,43 +3,62 @@ import { Bindings, PagoEntity, VerifyRequest } from '../types'
 
 export const verifyRoutes = new Hono<{ Bindings: Bindings }>()
 
+function parseExpectedAmount(raw: number | string | undefined | null): number | null {
+  if (raw === undefined || raw === null) return null
+  if (typeof raw === 'number') return isNaN(raw) ? null : raw
+  const clean = String(raw).trim().replace(',', '.')
+  const num = parseFloat(clean)
+  return isNaN(num) ? null : num
+}
+
+function extractLast4Digits(phone?: string, explicitLast4?: string): string | null {
+  if (explicitLast4 && explicitLast4.trim().length === 4) {
+    return explicitLast4.trim()
+  }
+  if (!phone) return null
+  const digits = phone.replace(/[^0-9]/g, '')
+  if (digits.length >= 4) {
+    return digits.slice(-4)
+  }
+  return null
+}
+
 verifyRoutes.post('/verificar', async (c) => {
   const body = await c.req.json<VerifyRequest>()
-  const { referencia, telefonoUltimos4, montoEsperado, fecha } = body
+  const { referencia, telefono, telefonoUltimos4, montoEsperado, fecha, banco } = body
 
-  if (montoEsperado === undefined || montoEsperado === null || isNaN(Number(montoEsperado))) {
+  const expectedAmount = parseExpectedAmount(montoEsperado)
+  if (expectedAmount === null) {
     return c.json({ verificado: false, motivo: 'montoEsperado numérico es requerido' }, 400)
   }
 
-  const expectedAmount = Number(montoEsperado)
-  let pago: PagoEntity | null = null
+  const phoneLast4 = extractLast4Digits(telefono, telefonoUltimos4)
+  const cleanRef = referencia?.trim()
 
-  // Strategy A: Reconciliation by reference suffix (e.g. BDV, Mercantil)
-  if (referencia && referencia.trim().length >= 4) {
-    const cleanRef = referencia.trim()
+  if ((!cleanRef || cleanRef.length < 4) && !phoneLast4) {
+    return c.json({
+      verificado: false,
+      motivo: 'Debe proporcionar al menos "referencia" (mínimo 4 dígitos) o teléfono (mínimo 4 dígitos)'
+    }, 400)
+  }
+
+  let pago: PagoEntity | null = null
+  let matchMethod: 'referencia' | 'telefono_monto' | null = null
+
+  // -------------------------------------------------------------
+  // PASO 1 (Prioridad Alta): Buscar por Sufijo de Referencia (e.g. BDV)
+  // -------------------------------------------------------------
+  if (cleanRef && cleanRef.length >= 4) {
     let query = `
       SELECT * FROM pagos 
       WHERE reference LIKE ? AND used = 0
     `
     const params: any[] = [`%${cleanRef}`]
 
-    if (fecha) {
-      query += ` AND date LIKE ?`
-      params.push(`%${fecha.trim()}%`)
+    if (banco) {
+      query += ` AND bank = ?`
+      params.push(banco.trim().toUpperCase())
     }
-
-    query += ` ORDER BY received_at DESC LIMIT 1`
-
-    pago = await c.env.DB.prepare(query).bind(...params).first<PagoEntity>()
-  } 
-  // Strategy B: Reconciliation by last 4 digits of phone number (e.g. BFC push without reference)
-  else if (telefonoUltimos4 && telefonoUltimos4.trim().length === 4) {
-    const cleanPhone = telefonoUltimos4.trim()
-    let query = `
-      SELECT * FROM pagos 
-      WHERE phone_last_digits = ? AND used = 0
-    `
-    const params: any[] = [cleanPhone]
 
     if (fecha) {
       query += ` AND date LIKE ?`
@@ -48,32 +67,67 @@ verifyRoutes.post('/verificar', async (c) => {
 
     query += ` ORDER BY received_at DESC LIMIT 1`
 
-    pago = await c.env.DB.prepare(query).bind(...params).first<PagoEntity>()
-  } else {
-    return c.json({
-      verificado: false,
-      motivo: 'Debe proporcionar al menos "referencia" (mínimo 4 dígitos) o "telefonoUltimos4" (exactamente 4 dígitos)'
-    }, 400)
+    const candidate = await c.env.DB.prepare(query).bind(...params).first<PagoEntity>()
+
+    // Si encontró el pago por referencia, validamos el monto
+    if (candidate) {
+      if (Math.abs(Number(candidate.amount_bs) - expectedAmount) <= 0.01) {
+        pago = candidate
+        matchMethod = 'referencia'
+      }
+    }
   }
 
+  // -------------------------------------------------------------
+  // PASO 2 (Cascada / Fallback): Buscar por Últimos 4 Dígitos del Teléfono + Monto
+  // (Crucial para Bancamiga y BFC que no emiten número de referencia en el push)
+  // -------------------------------------------------------------
+  if (!pago && phoneLast4) {
+    let query = `
+      SELECT * FROM pagos 
+      WHERE phone_last_digits = ? 
+        AND ABS(amount_bs - ?) <= 0.01 
+        AND used = 0
+    `
+    const params: any[] = [phoneLast4, expectedAmount]
+
+    if (banco) {
+      query += ` AND bank = ?`
+      params.push(banco.trim().toUpperCase())
+    }
+
+    if (fecha) {
+      query += ` AND date LIKE ?`
+      params.push(`%${fecha.trim()}%`)
+    }
+
+    query += ` ORDER BY received_at DESC LIMIT 1`
+
+    const candidate = await c.env.DB.prepare(query).bind(...params).first<PagoEntity>()
+
+    if (candidate) {
+      pago = candidate
+      matchMethod = 'telefono_monto'
+    }
+  }
+
+  // Si después de la cascada no encontramos ningún pago disponible
   if (!pago) {
     return c.json({
       verificado: false,
-      motivo: 'Pago no encontrado o ya fue utilizado previamente'
+      motivo: 'Pago no encontrado o ya fue utilizado previamente',
+      criterios_evaluados: {
+        referencia: cleanRef || null,
+        telefonoUltimos4: phoneLast4 || null,
+        montoEsperado: expectedAmount,
+        fecha: fecha || null
+      }
     }, 404)
   }
 
-  // Exact amount matching with floating point tolerance of 0.01 Bs
-  if (Math.abs(Number(pago.amount_bs) - expectedAmount) > 0.01) {
-    return c.json({
-      verificado: false,
-      motivo: 'El monto no coincide con el pago recibido',
-      montoRecibido: pago.amount_bs,
-      montoEsperado: expectedAmount
-    }, 400)
-  }
-
-  // Atomically mark payment as used to prevent double-spending
+  // -------------------------------------------------------------
+  // PASO 3: Marcado Atómico como Utilizado (Anti Doble Gasto)
+  // -------------------------------------------------------------
   await c.env.DB.prepare(`
     UPDATE pagos 
     SET used = 1, used_at = datetime('now') 
@@ -82,6 +136,7 @@ verifyRoutes.post('/verificar', async (c) => {
 
   return c.json({
     verificado: true,
+    metodo_coincidencia: matchMethod,
     mensaje: 'Pago verificado y marcado como utilizado exitosamente',
     pago: {
       id: pago.id,
@@ -100,22 +155,47 @@ verifyRoutes.post('/verificar', async (c) => {
 // Read-only inspection endpoint (does not mark as used)
 verifyRoutes.post('/consultar', async (c) => {
   const body = await c.req.json<VerifyRequest>()
-  const { referencia, telefonoUltimos4, montoEsperado } = body
+  const { referencia, telefono, telefonoUltimos4, montoEsperado, fecha, banco } = body
+
+  const expectedAmount = parseExpectedAmount(montoEsperado)
+  const phoneLast4 = extractLast4Digits(telefono, telefonoUltimos4)
+  const cleanRef = referencia?.trim()
 
   let pago: PagoEntity | null = null
+  let matchMethod: 'referencia' | 'telefono_monto' | null = null
 
-  if (referencia && referencia.trim().length >= 4) {
-    pago = await c.env.DB.prepare(`
-      SELECT * FROM pagos 
-      WHERE reference LIKE ? 
-      ORDER BY received_at DESC LIMIT 1
-    `).bind(`%${referencia.trim()}`).first<PagoEntity>()
-  } else if (telefonoUltimos4 && telefonoUltimos4.trim().length === 4) {
-    pago = await c.env.DB.prepare(`
-      SELECT * FROM pagos 
-      WHERE phone_last_digits = ? 
-      ORDER BY received_at DESC LIMIT 1
-    `).bind(telefonoUltimos4.trim()).first<PagoEntity>()
+  // Cascada Paso 1: Por Referencia
+  if (cleanRef && cleanRef.length >= 4) {
+    let query = `SELECT * FROM pagos WHERE reference LIKE ?`
+    const params: any[] = [`%${cleanRef}`]
+    if (banco) {
+      query += ` AND bank = ?`
+      params.push(banco.trim().toUpperCase())
+    }
+    if (fecha) {
+      query += ` AND date LIKE ?`
+      params.push(`%${fecha.trim()}%`)
+    }
+    query += ` ORDER BY received_at DESC LIMIT 1`
+    pago = await c.env.DB.prepare(query).bind(...params).first<PagoEntity>()
+    if (pago) matchMethod = 'referencia'
+  }
+
+  // Cascada Paso 2: Por Teléfono + Monto
+  if (!pago && phoneLast4 && expectedAmount !== null) {
+    let query = `SELECT * FROM pagos WHERE phone_last_digits = ? AND ABS(amount_bs - ?) <= 0.01`
+    const params: any[] = [phoneLast4, expectedAmount]
+    if (banco) {
+      query += ` AND bank = ?`
+      params.push(banco.trim().toUpperCase())
+    }
+    if (fecha) {
+      query += ` AND date LIKE ?`
+      params.push(`%${fecha.trim()}%`)
+    }
+    query += ` ORDER BY received_at DESC LIMIT 1`
+    pago = await c.env.DB.prepare(query).bind(...params).first<PagoEntity>()
+    if (pago) matchMethod = 'telefono_monto'
   }
 
   if (!pago) {
@@ -124,6 +204,7 @@ verifyRoutes.post('/consultar', async (c) => {
 
   return c.json({
     encontrado: true,
+    metodo_coincidencia: matchMethod,
     usado: pago.used === 1,
     pago: {
       id: pago.id,
